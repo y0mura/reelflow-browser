@@ -1,31 +1,30 @@
 // ============================================================
-//  ReelFlow browser proxy — DRAFT, not deployed
+//  ReelFlow browser proxy
 // ------------------------------------------------------------
 //  A second Worker alongside reelflow-proxy. The existing one
 //  fetches a page's HTML directly (fast, no JavaScript, no
 //  clicking). This one drives a real headless Chrome on
-//  Cloudflare (Browser Run), so it can get past gates that are
-//  enforced BEFORE the content is served: age splashes that
-//  withhold the page until a cookie is set, and JavaScript
-//  challenge pages ("Just a moment…") that a plain fetch can
-//  never pass.
-//
-//  How a site gets "solved": add one entry to SITE_RULES below,
-//  keyed by hostname, describing that site's gate (button
-//  selectors and/or button texts, in click order). One Worker
-//  handles every site — you do NOT need a Worker per site.
-//  Sites with no entry get the generic Yes/Enter text-click.
+//  Cloudflare (Browser Run), so it can get past walls that are
+//  enforced BEFORE the content is served: anti-bot shield pages
+//  (bunny.net, "Just a moment") and age splashes that withhold
+//  the page until a cookie is set.
 //
 //  Contract with the app is identical to reelflow-proxy:
 //    GET /?url=<encoded page address>  ->  page HTML + CORS *
-//  Differences vs the write-up this was based on:
-//   - CORS headers added (without them the app cannot read
-//     the response at all — the original snippet omitted them)
-//   - session reuse only connects to sessions that are not
-//     already connected to another request
-//   - gate-clicking starts from the button-text list the app's
-//     INJ script uses, extended with your three sites' exact
-//     "18 or older" phrases, as a fallback to selectors
+//
+//  Resilience rules (learned from a live Error 1101 outage):
+//   - NEVER throw out of the fetch handler. Any failure comes
+//     back as a readable 502 text response naming the error,
+//     so a failure is diagnosable instead of a bare 1101 page.
+//   - Browser acquisition is patient: reuse a free session if
+//     one exists; if sessions exist but are all busy, wait for
+//     one to free up instead of launching yet another browser
+//     (launching into the account's concurrent-browser limit
+//     is what threw, on every request, until they expired).
+//   - If a run fails mid-flight, CLOSE that browser instead of
+//     disconnecting it, so a bad browser is not reused forever.
+//   - A navigation timeout is not fatal: continue with
+//     whatever part of the page did load.
 // ============================================================
 
 import puppeteer from "@cloudflare/puppeteer";
@@ -34,12 +33,6 @@ import puppeteer from "@cloudflare/puppeteer";
 // selectors: CSS selectors to try, in order.
 // texts:     button/link texts to click if selectors miss.
 // waitAfterMs: pause after the last click before reading HTML.
-// Example shape (not a real site):
-//   "example-site.com": {
-//     selectors: ["button#age-yes", ".age-gate .confirm"],
-//     texts: ["I am over 18", "Enter"],
-//     waitAfterMs: 1200,
-//   },
 const SITE_RULES = {
   // LeakGallery (Angular app): the gate is an <app-age-verification>
   // component and the button is a plain <div class="action ok">
@@ -52,8 +45,7 @@ const SITE_RULES = {
   },
 };
 
-// Generic fallback for sites with no rule: the same button
-// texts the app's in-page INJ script already clicks.
+// Generic fallback for sites with no rule.
 const GENERIC_TEXTS = [
   "yes",
   "i am 18",
@@ -79,6 +71,45 @@ const CORS = {
   "Access-Control-Allow-Headers": "*",
 };
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Get a browser without ever making the pileup worse: prefer an
+// idle existing session; wait out busy ones; launch only when
+// the account has no browsers at all. Returns {browser, reused}
+// or throws the last acquisition error after ~30s of patience.
+async function acquireBrowser(env) {
+  let lastErr = null;
+  for (let round = 0; round < 6; round++) {
+    const sessions = await puppeteer.sessions(env.MYBROWSER);
+    const free = sessions.filter((s) => !s.connectionId);
+    for (const session of free) {
+      try {
+        const browser = await puppeteer.connect(
+          env.MYBROWSER,
+          session.sessionId
+        );
+        return { browser, reused: true };
+      } catch (e) {
+        lastErr = e; // died between listing and connecting
+      }
+    }
+    if (sessions.length === 0) {
+      try {
+        const browser = await puppeteer.launch(env.MYBROWSER, {
+          keep_alive: 600000, // idle shutdown stretched to 10 minutes
+        });
+        return { browser, reused: false };
+      } catch (e) {
+        lastErr = e; // e.g. concurrent-browser limit — wait, retry
+      }
+    }
+    // Sessions exist but every one is busy (or launch just
+    // failed): wait for the pile to thin instead of adding to it.
+    await sleep(5000);
+  }
+  throw lastErr || new Error("No browser session became available");
+}
+
 // Anti-bot shield pages (bunny.net BunnyShield, Cloudflare's
 // "Just a moment", similar) need time: their script verifies the
 // browser, submits, sets a cookie, and only then loads the real
@@ -98,7 +129,7 @@ async function waitOutChallenge(page, budgetMs) {
       .catch(() => "");
     if (!CHALLENGE_RX.test(head)) return true; // cleared (or never was one)
     if (Date.now() - start > budgetMs) return false; // still shielded
-    await new Promise((r) => setTimeout(r, 2000));
+    await sleep(2000);
   }
 }
 
@@ -161,67 +192,60 @@ export default {
       return new Response(null, { headers: CORS });
     }
 
-    const targetUrl = new URL(request.url).searchParams.get("url");
+    const reqUrl = new URL(request.url);
+    const targetUrl = reqUrl.searchParams.get("url");
     if (!targetUrl) {
       return new Response(
         "ReelFlow browser proxy is running.\n\nUse it like:\n  " +
-          new URL(request.url).origin +
+          reqUrl.origin +
           "/?url=https%3A%2F%2Fexample.com",
         { headers: { "content-type": "text/plain; charset=utf-8", ...CORS } }
       );
     }
 
-    let pageUrl;
+    let browser = null;
+    let page = null;
+    let broken = false;
     try {
-      pageUrl = new URL(targetUrl);
-    } catch (e) {
-      return new Response("That ?url= value is not a valid web address.", {
-        status: 400,
-        headers: CORS,
-      });
-    }
-    if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") {
-      return new Response("Only http and https pages can be fetched.", {
-        status: 400,
-        headers: CORS,
-      });
-    }
-
-    const rule = SITE_RULES[pageUrl.hostname.replace(/^www\./, "")] || {};
-
-    let browser;
-    let reused = false;
-
-    // Reuse a warm browser if one is idle. Filter to sessions
-    // with no live connection — connecting to a busy session
-    // collides with the request using it.
-    const sessions = await puppeteer.sessions(env.MYBROWSER);
-    const free = sessions.filter((s) => !s.connectionId);
-    for (const session of free) {
+      let pageUrl;
       try {
-        browser = await puppeteer.connect(env.MYBROWSER, session.sessionId);
-        reused = true;
-        break;
+        pageUrl = new URL(targetUrl);
       } catch (e) {
-        // Session ended between listing and connecting; try next.
+        return new Response("That ?url= value is not a valid web address.", {
+          status: 400,
+          headers: CORS,
+        });
       }
-    }
+      if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") {
+        return new Response("Only http and https pages can be fetched.", {
+          status: 400,
+          headers: CORS,
+        });
+      }
 
-    if (!browser) {
-      browser = await puppeteer.launch(env.MYBROWSER, {
-        keep_alive: 600000, // idle shutdown stretched to 10 minutes
-      });
-    }
+      const rule = SITE_RULES[pageUrl.hostname.replace(/^www\./, "")] || {};
 
-    // Default browser context on purpose (no createBrowserContext):
-    // that is what makes the gate cookie / storage persist across
-    // requests for as long as this browser stays alive.
-    const page = await browser.newPage();
-    try {
-      await page.goto(targetUrl, {
-        waitUntil: "networkidle2",
-        timeout: 30000,
-      });
+      const got = await acquireBrowser(env);
+      browser = got.browser;
+      const reused = got.reused;
+
+      // Default browser context on purpose (no
+      // createBrowserContext): that is what makes the gate
+      // cookie / storage persist across requests for as long as
+      // this browser stays alive.
+      page = await browser.newPage();
+
+      let navError = "";
+      try {
+        await page.goto(targetUrl, {
+          waitUntil: "networkidle2",
+          timeout: 30000,
+        });
+      } catch (e) {
+        // A slow or endlessly-chatty page is not fatal — work
+        // with whatever loaded.
+        navError = String((e && e.message) || e).slice(0, 200);
+      }
 
       // Shield first: if this is an anti-bot check page, give its
       // script time to verify, submit, and load the real page
@@ -233,13 +257,9 @@ export default {
       let clicked = false;
       for (let attempt = 0; attempt < 4 && !clicked; attempt++) {
         clicked = await clickGate(page, rule);
-        if (!clicked && attempt < 3) {
-          await new Promise((r) => setTimeout(r, 700));
-        }
+        if (!clicked && attempt < 3) await sleep(700);
       }
-      if (clicked) {
-        await new Promise((r) => setTimeout(r, rule.waitAfterMs || 900));
-      }
+      if (clicked) await sleep(rule.waitAfterMs || 900);
 
       const html = await page.content();
       return new Response(html, {
@@ -248,14 +268,35 @@ export default {
           "x-browser-reused": String(reused),
           "x-gate-clicked": String(clicked),
           "x-challenge": String(!shieldCleared),
+          ...(navError ? { "x-nav-error": navError } : {}),
           ...CORS,
         },
       });
+    } catch (e) {
+      // Never surface a bare 1101: name the failure so it can be
+      // read (by a human, a screenshot, or a test fetch) and fixed.
+      broken = true;
+      const msg = (e && e.stack) || String((e && e.message) || e);
+      return new Response(
+        "ReelFlow browser proxy error:\n\n" + msg.slice(0, 2000),
+        {
+          status: 502,
+          headers: { "content-type": "text/plain; charset=utf-8", ...CORS },
+        }
+      );
     } finally {
-      // Close the tab only, then disconnect: the browser (and its
-      // cookies) stays alive for the next request.
-      await page.close().catch(() => {});
-      await browser.disconnect();
+      if (page) await page.close().catch(() => {});
+      if (browser) {
+        if (broken) {
+          // Retire a browser that just failed mid-flight instead
+          // of leaving it in the reuse pool.
+          await browser.close().catch(() => {});
+        } else {
+          // Disconnect (not close): the browser and its cookies
+          // stay alive for the next request.
+          await browser.disconnect().catch(() => {});
+        }
+      }
     }
   },
 };
