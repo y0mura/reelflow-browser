@@ -12,6 +12,13 @@
 //  Contract with the app is identical to reelflow-proxy:
 //    GET /?url=<encoded page address>  ->  page HTML + CORS *
 //
+//  Lifecycle: hit-and-run by default. The Worker's job is to
+//  clear the shield/gate and hand ReelFlow the resulting page;
+//  ReelFlow then displays that snapshot locally, so the remote
+//  browser normally has no reason to remain alive. Add &warm=1
+//  only for an explicit burst of page-to-page requests where
+//  reuse is worth spending idle browser time.
+//
 //  Resilience rules (learned from a live Error 1101 outage):
 //   - NEVER throw out of the fetch handler. Any failure comes
 //     back as a readable 502 text response naming the error,
@@ -77,7 +84,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // idle existing session; wait out busy ones; launch only when
 // the account has no browsers at all. Returns {browser, reused}
 // or throws the last acquisition error after ~30s of patience.
-async function acquireBrowser(env) {
+async function acquireBrowser(env, warmMode) {
   let lastErr = null;
   for (let round = 0; round < 6; round++) {
     const sessions = await puppeteer.sessions(env.MYBROWSER);
@@ -96,7 +103,15 @@ async function acquireBrowser(env) {
     if (sessions.length === 0) {
       try {
         const browser = await puppeteer.launch(env.MYBROWSER, {
-          keep_alive: 600000, // idle shutdown stretched to 10 minutes
+          // Only an explicit warm request asks Cloudflare to
+          // stretch the idle lifetime after disconnect. The
+          // default hit-and-run path closes the browser itself,
+          // so no idle tail is wanted: Workers Free Browser Run
+          // has only 10 minutes of browser time per day, and a
+          // kept-alive browser keeps spending it while idle.
+          // Warm mode keeps a deliberately short 2-minute tail,
+          // enough for a burst of page fetches seconds apart.
+          keep_alive: warmMode ? 120000 : 60000,
         });
         return { browser, reused: false };
       } catch (e) {
@@ -194,6 +209,19 @@ export default {
 
     const reqUrl = new URL(request.url);
     const targetUrl = reqUrl.searchParams.get("url");
+    // Hit-and-run is the DEFAULT: do the work, return the page,
+    // then CLOSE the browser so browser time is spent only on
+    // the work itself. ReelFlow displays the returned page
+    // locally; it does not need this remote browser to stay
+    // alive while the user reads or uses that page.
+    //
+    // &warm=1 is the explicit hybrid override for a burst of
+    // page-to-page fetches where reuse can amortize launches
+    // and shield/gate passes. &close=1 remains accepted as an
+    // explicit close request and wins over &warm=1.
+    const warmMode =
+      reqUrl.searchParams.get("warm") === "1" &&
+      reqUrl.searchParams.get("close") !== "1";
     if (!targetUrl) {
       return new Response(
         "ReelFlow browser proxy is running.\n\nUse it like:\n  " +
@@ -225,14 +253,16 @@ export default {
 
       const rule = SITE_RULES[pageUrl.hostname.replace(/^www\./, "")] || {};
 
-      const got = await acquireBrowser(env);
+      const got = await acquireBrowser(env, warmMode);
       browser = got.browser;
       const reused = got.reused;
 
       // Default browser context on purpose (no
-      // createBrowserContext): that is what makes the gate
-      // cookie / storage persist across requests for as long as
-      // this browser stays alive.
+      // createBrowserContext): in warm mode that is what lets
+      // the gate cookie / storage persist across requests for
+      // as long as this browser stays alive. In the default
+      // hit-and-run mode it only needs to persist within this
+      // one clearance-and-capture request.
       page = await browser.newPage();
 
       let navError = "";
@@ -266,6 +296,7 @@ export default {
         headers: {
           "content-type": "text/html;charset=UTF-8",
           "x-browser-reused": String(reused),
+          "x-browser-mode": warmMode ? "warm" : "hit-and-run",
           "x-gate-clicked": String(clicked),
           "x-challenge": String(!shieldCleared),
           ...(navError ? { "x-nav-error": navError } : {}),
@@ -287,13 +318,16 @@ export default {
     } finally {
       if (page) await page.close().catch(() => {});
       if (browser) {
-        if (broken) {
+        if (broken || !warmMode) {
           // Retire a browser that just failed mid-flight instead
-          // of leaving it in the reuse pool.
+          // of leaving it in the reuse pool. The default
+          // hit-and-run path also closes a successful browser
+          // immediately so the meter stops when the work is done.
           await browser.close().catch(() => {});
         } else {
-          // Disconnect (not close): the browser and its cookies
-          // stay alive for the next request.
+          // Explicit warm mode only: disconnect (not close), so
+          // the browser and its cookies stay alive briefly for
+          // the next request in a page-switching burst.
           await browser.disconnect().catch(() => {});
         }
       }
