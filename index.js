@@ -41,7 +41,15 @@ import puppeteer from "@cloudflare/puppeteer";
 //     waitAfterMs: 1200,
 //   },
 const SITE_RULES = {
-  // add solved sites here, one entry per hostname
+  // LeakGallery (Angular app): the gate is an <app-age-verification>
+  // component and the button is a plain <div class="action ok">
+  // wrapping a <p> with the text — not a real <button>, which is
+  // why the first version's clicker missed it entirely.
+  "leakgallery.com": {
+    selectors: ["app-age-verification .action.ok", ".action.ok"],
+    texts: ["i am 18 or older - enter"],
+    waitAfterMs: 1500,
+  },
 };
 
 // Generic fallback for sites with no rule: the same button
@@ -71,6 +79,29 @@ const CORS = {
   "Access-Control-Allow-Headers": "*",
 };
 
+// Anti-bot shield pages (bunny.net BunnyShield, Cloudflare's
+// "Just a moment", similar) need time: their script verifies the
+// browser, submits, sets a cookie, and only then loads the real
+// page. Capturing immediately returns the shield itself — a tiny
+// page (~2KB) instead of the site. Poll the visible text until
+// the shield wording disappears or the budget runs out.
+const CHALLENGE_RX =
+  /establishing a secure connection|hold tight|checking your browser|just a moment|verify you are human/i;
+
+async function waitOutChallenge(page, budgetMs) {
+  const start = Date.now();
+  for (;;) {
+    const head = await page
+      .evaluate(() =>
+        document.body ? document.body.innerText.slice(0, 600) : ""
+      )
+      .catch(() => "");
+    if (!CHALLENGE_RX.test(head)) return true; // cleared (or never was one)
+    if (Date.now() - start > budgetMs) return false; // still shielded
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
 async function clickGate(page, rule) {
   // 1. Site-specific / explicit selectors first.
   for (const sel of rule.selectors || []) {
@@ -80,26 +111,45 @@ async function clickGate(page, rule) {
       return true;
     }
   }
-  // 2. Click by visible button text.
+  // 2. Click by visible text. Wider net than real buttons only:
+  // some gates (LeakGallery) use a plain <div> with the text in a
+  // child <p>. Among every element whose full text matches, pick
+  // the deepest one (fewest element descendants, gate containers
+  // preferred) and click it — the click bubbles up to whatever
+  // ancestor actually holds the site's click handler.
   const texts = rule.texts && rule.texts.length ? rule.texts : GENERIC_TEXTS;
   const clicked = await page
     .evaluate((wanted) => {
-      const els = document.querySelectorAll(
-        'button, a, input[type="button"], input[type="submit"], [role="button"], .btn'
-      );
-      for (const b of els) {
-        const t = (b.innerText || b.value || "")
+      const norm = (s) =>
+        (s || "")
           .trim()
           .toLowerCase()
           .replace(/[’‘]/g, "'")
           .replace(/[–—]/g, "-")
           .replace(/\s+/g, " ");
-        if (wanted.includes(t)) {
-          b.click();
-          return t;
-        }
+      const els = document.querySelectorAll(
+        'button, a, input[type="button"], input[type="submit"], [role="button"], .btn, .action, div, span, p, li'
+      );
+      const hits = [];
+      for (const b of els) {
+        const t = norm(b.innerText || b.value || "");
+        if (wanted.includes(t)) hits.push(b);
       }
-      return null;
+      if (!hits.length) return null;
+      const inGate = (el) =>
+        el.closest(
+          '[class*="age" i], [id*="age" i], [class*="verif" i], [class*="modal" i], [class*="overlay" i], [class*="splash" i]'
+        )
+          ? 0
+          : 1;
+      hits.sort(
+        (x, y) =>
+          inGate(x) - inGate(y) ||
+          x.querySelectorAll("*").length - y.querySelectorAll("*").length
+      );
+      const el = hits[0];
+      el.click();
+      return norm(el.innerText || el.value || "");
     }, texts)
     .catch(() => null);
   return !!clicked;
@@ -173,7 +223,20 @@ export default {
         timeout: 30000,
       });
 
-      const clicked = await clickGate(page, rule);
+      // Shield first: if this is an anti-bot check page, give its
+      // script time to verify, submit, and load the real page
+      // before doing anything else.
+      const shieldCleared = await waitOutChallenge(page, 20000);
+
+      // SPA gates can render after the load settles — retry the
+      // click a few times over ~2 seconds before giving up.
+      let clicked = false;
+      for (let attempt = 0; attempt < 4 && !clicked; attempt++) {
+        clicked = await clickGate(page, rule);
+        if (!clicked && attempt < 3) {
+          await new Promise((r) => setTimeout(r, 700));
+        }
+      }
       if (clicked) {
         await new Promise((r) => setTimeout(r, rule.waitAfterMs || 900));
       }
@@ -184,6 +247,7 @@ export default {
           "content-type": "text/html;charset=UTF-8",
           "x-browser-reused": String(reused),
           "x-gate-clicked": String(clicked),
+          "x-challenge": String(!shieldCleared),
           ...CORS,
         },
       });
