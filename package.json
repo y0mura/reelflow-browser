@@ -1,0 +1,11 @@
+{
+  "name": "reelflow-browser",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/puppeteer": "^1.1.0",
+    "wrangler": "^4.0.0"
+  }
+}
